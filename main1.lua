@@ -993,7 +993,6 @@ function startProcessing(srcPath, mode)
         _G.echo_busy = false
         closeDialog()
         if isInTemp(srcPath) and path ~= srcPath then
-            pcall(function() File(srcPath).delete() end)
         end
         _G.rec_file_path = path
         _G.temp_file_path = nil
