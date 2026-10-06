@@ -101,8 +101,8 @@ _G.update_prompt_open = false
 -- Auto update settings. Raise the number below every time you publish
 -- a new version on GitHub (1, 2, 3 ...). A phone with a lower number
 -- will offer the update when the plugin is opened.
-local APP_VERSION = 3
-local UPDATE_NOTE = "UPDATED v3 - safer updates"
+local APP_VERSION = 2
+local UPDATE_NOTE = "UPDATED v2 - stronger noise cleaning"
 local UPDATE_URL = "https://raw.githubusercontent.com/umarofficial786/Audio-recorder/refs/heads/main/main.lua"
 
 local monitorHandler = Handler(Looper.getMainLooper())
@@ -1978,4 +1978,314 @@ function showRecordingsList()
                 local name = tostring(f.getName())
                 local lower = string.lower(name)
                 if f.isFile() and (string.find(lower, "%.m4a$") or string.find(lower, "%.wav$")
-                    or string.find(lower, "%.aac$") or string.find(lower, "
+                    or string.find(lower, "%.aac$") or string.find(lower, "%.mp3$")
+                    or string.find(lower, "%.3gp$")) then
+                    items[#items + 1] = {
+                        path = tostring(f.getAbsolutePath()),
+                        name = name,
+                        mod = f.lastModified(),
+                        len = f.length()
+                    }
+                end
+            end
+        end
+    end)
+    table.sort(items, function(a, b) return a.mod > b.mod end)
+
+    local root = LinearLayout(ctx)
+    root.setOrientation(1)
+    root.setPadding(30, 30, 30, 30)
+
+    local title = TextView(ctx)
+    title.setText("My Recordings (" .. #items .. ")")
+    title.setTextSize(20)
+    title.setGravity(17)
+    root.addView(title)
+
+    local closeBtn = Button(ctx)
+    closeBtn.setText("Close")
+    root.addView(closeBtn)
+
+    local scroll = ScrollView(ctx)
+    local col = LinearLayout(ctx)
+    col.setOrientation(1)
+    scroll.addView(col)
+    root.addView(scroll)
+
+    local d = LuaDialog(ctx).setView(root)
+    closeBtn.onClick = safe(function()
+        stopPlayer()
+        d.dismiss()
+    end)
+
+    if #items == 0 then
+        local empty = TextView(ctx)
+        empty.setText("No recordings yet")
+        empty.setGravity(17)
+        empty.setPadding(0, 30, 0, 30)
+        col.addView(empty)
+    end
+
+    local shown = 0
+    for _, it in ipairs(items) do
+        shown = shown + 1
+        if shown > 100 then break end
+        local b = Button(ctx)
+        local kb = it.len / 1024
+        local sizeText
+        if kb > 1024 then
+            sizeText = string.format("%.2f MB", kb / 1024)
+        else
+            sizeText = string.format("%.0f KB", kb)
+        end
+        local dateText = os.date("%Y-%m-%d %H:%M", math.floor(it.mod / 1000))
+        b.setText(it.name .. "\n" .. sizeText .. "   " .. dateText)
+        pcall(function() b.setAllCaps(false) end)
+        b.onClick = safe(function()
+            d.dismiss()
+            stopPlayer()
+            _G.rec_file_path = it.path
+            _G.temp_file_path = nil
+            showResult("Recording", true)
+        end)
+        col.addView(b)
+    end
+
+    d.show()
+end
+
+------------------------------------------------------------
+-- AUTO UPDATE FROM GITHUB
+-- 1. When the menu opens, the script downloads main.lua from
+--    UPDATE_URL and compares the version number inside it.
+-- 2. If GitHub has a HIGHER number, an "Update available" window
+--    appears with [Update now] and [Later].
+-- 3. [Update now] checks the new file for syntax errors, keeps a
+--    backup (main.lua.bak) and overwrites this script.
+-- The new version starts the next time you run the plugin.
+------------------------------------------------------------
+local function copyFile(srcPath, dstPath)
+    local ok = pcall(function()
+        local ins = FileInputStream(srcPath)
+        local outs = FileOutputStream(dstPath)
+        local b = newBytes(65536)
+        while true do
+            local n = ins.read(b)
+            if n == nil or n <= 0 then break end
+            outs.write(b, 0, n)
+        end
+        ins.close()
+        outs.close()
+    end)
+    return ok
+end
+
+-- Download using a background Java thread (fallback method)
+local function httpGetJava(url, cb)
+    local h = Handler(Looper.getMainLooper())
+    local started, startErr = pcall(function()
+        local t = luajava.newInstance("java.lang.Thread", Runnable({
+            run = function()
+                local okR, res, code = pcall(function()
+                    local URL = luajava.bindClass("java.net.URL")
+                    local conn = URL(url).openConnection()
+                    conn.setConnectTimeout(15000)
+                    conn.setReadTimeout(20000)
+                    conn.setRequestProperty("User-Agent", "Mozilla/5.0")
+                    local c = conn.getResponseCode()
+                    if c ~= 200 then return nil, c end
+                    local ins = conn.getInputStream()
+                    local baos = luajava.newInstance("java.io.ByteArrayOutputStream")
+                    local b = newBytes(8192)
+                    while true do
+                        local n = ins.read(b)
+                        if n == nil or n <= 0 then break end
+                        baos.write(b, 0, n)
+                    end
+                    ins.close()
+                    return tostring(String(baos.toByteArray(), "UTF-8")), c
+                end)
+                h.post(Runnable({
+                    run = function()
+                        if okR and res then
+                            cb(true, res)
+                        else
+                            cb(false, "Download failed: " .. tostring(code or res))
+                        end
+                    end
+                }))
+            end
+        }))
+        t.start()
+    end)
+    if not started then cb(false, "Could not start download: " .. tostring(startErr)) end
+end
+
+-- Download text from a URL. Uses the host's Http library when it
+-- exists, and falls back to Java networking otherwise.
+local function httpGet(url, cb)
+    local done = false
+    local function deliver(ok, body)
+        if done then return end
+        done = true
+        cb(ok, body)
+    end
+    if Http then
+        local okH = pcall(function()
+            Http.get(url, nil, "UTF-8", nil, function(code, body)
+                if code == 200 and body and #tostring(body) > 100 then
+                    deliver(true, tostring(body))
+                else
+                    deliver(false, "HTTP " .. tostring(code))
+                end
+            end)
+        end)
+        if okH then
+            -- safety net: if Http never answers, use the Java method
+            local hh = Handler(Looper.getMainLooper())
+            hh.postDelayed(Runnable({
+                run = function()
+                    if not done then httpGetJava(url, deliver) end
+                end
+            }), 12000)
+            return
+        end
+    end
+    httpGetJava(url, deliver)
+end
+
+-- Find where this script lives on the phone (no hard-coded path)
+local function findSelfPath()
+    local p = nil
+    pcall(function()
+        local src = debug.getinfo(1, "S").source
+        if src and string.sub(src, 1, 1) == "@" then p = string.sub(src, 2) end
+    end)
+    if p and File(p).exists() then return p end
+    p = nil
+    pcall(function()
+        local roots = {"/storage/emulated/0/", "/sdcard/"}
+        for _, root in ipairs(roots) do
+            local list = File(root).listFiles()
+            if list then
+                for i = 0, #list - 1 do
+                    local f = File(list[i], "Plugins/Umer Jan Audio Editor Pro/main.lua")
+                    if f.exists() then
+                        p = tostring(f.getAbsolutePath())
+                        return
+                    end
+                end
+            end
+        end
+    end)
+    return p
+end
+
+local function applyUpdate(content)
+    local selfPath = findSelfPath()
+    if not selfPath then
+        return false, "Could not find main.lua on this phone, so it was not updated."
+    end
+    local loader = loadstring or load
+    local chunk, err = loader(content)
+    if not chunk then
+        return false, "The new version has a syntax error, update rejected: " .. tostring(err)
+    end
+    if not string.find(content, "raw.githubusercontent.com", 1, true) or not string.find(content, "APP_VERSION", 1, true) then
+        return false, "The new version does not contain the update link or version line, update rejected (it would stop future updates)."
+    end
+    local newPath = selfPath .. ".new"
+    local bakPath = selfPath .. ".bak"
+    local okW, eW = pcall(function()
+        local fos = FileOutputStream(newPath)
+        fos.write(String(content).getBytes("UTF-8"))
+        fos.close()
+    end)
+    if not okW then return false, "Could not write the new file: " .. tostring(eW) end
+    if File(newPath).length() < 1000 then
+        pcall(function() File(newPath).delete() end)
+        return false, "Downloaded file looks incomplete"
+    end
+    copyFile(selfPath, bakPath)
+    pcall(function() File(selfPath).delete() end)
+    if not moveFile(newPath, selfPath) then
+        copyFile(bakPath, selfPath) -- put the old version back
+        return false, "Could not replace main.lua, old version restored"
+    end
+    if File(selfPath).length() < 1000 then
+        copyFile(bakPath, selfPath)
+        return false, "The new file was damaged while saving, old version restored"
+    end
+    return true
+end
+
+local function showUpdatePrompt(remote, body)
+    if _G.update_prompt_open then return end
+    _G.update_prompt_open = true
+    say("Update available")
+    local layout = {
+        LinearLayout, orientation="vertical", padding="20dp",
+        {TextView, text="Update available", textSize="20sp", gravity="center", layout_marginBottom="10dp"},
+        {TextView, text="Your version: " .. APP_VERSION .. "\nNew version: " .. remote .. "\n\nInstall the new version now?", textSize="16sp", gravity="center", layout_marginBottom="20dp"},
+        {Button, id="btnUpdNow", text="Update now", layout_width="fill", height="55dp", layout_marginBottom="10dp"},
+        {Button, id="btnUpdLater", text="Later", layout_width="fill", height="50dp"}
+    }
+    local d = LuaDialog(ctx).setView(loadlayout(layout))
+    btnUpdNow.onClick = safe(function()
+        d.dismiss()
+        _G.update_prompt_open = false
+        local okA, errA = applyUpdate(body)
+        if okA then
+            logError("Updated from version " .. APP_VERSION .. " to " .. remote)
+            say("Update installed. Please run the plugin again")
+            showErrorDialog("Update installed", "Updated from version " .. APP_VERSION .. " to " .. remote .. ".\n\nClose this plugin and run it again to use the new version.")
+        else
+            logError("Update failed: " .. tostring(errA))
+            showErrorDialog("Update failed", tostring(errA))
+        end
+    end)
+    btnUpdLater.onClick = safe(function()
+        d.dismiss()
+        _G.update_prompt_open = false
+    end)
+    d.show()
+end
+
+function checkForUpdate(force)
+    if _G.rec_instance or _G.echo_busy then
+        if force then toast("Finish the current recording first") end
+        return
+    end
+    if force then toast("Checking for updates...") end
+    httpGet(UPDATE_URL, function(ok, body)
+        if not ok then
+            logError("Update check failed: " .. tostring(body))
+            if force then showErrorDialog("Update check failed", tostring(body)) end
+            return
+        end
+        local remote = tonumber(string.match(body, "APP_VERSION%s*=%s*(%d+)"))
+        if not remote then
+            logError("Update: no version line in downloaded file")
+            if force then showErrorDialog("Update problem", "The downloaded file has no version line") end
+            return
+        end
+        if remote <= APP_VERSION then
+            if force then toast("You already have the latest version (" .. APP_VERSION .. ")") end
+            return
+        end
+        showUpdatePrompt(remote, body)
+    end)
+end
+
+------------------------------------------------------------
+-- Execution Controller
+------------------------------------------------------------
+if _G.echo_busy then
+    toast("Processing is still running, please wait")
+elseif _G.rec_instance == nil then
+    toast("Version " .. APP_VERSION .. " is running")
+    showMenu()
+    checkForUpdate(false)
+else
+    showPausedDialog()
+end
